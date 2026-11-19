@@ -25,13 +25,15 @@ function validKickUrl(raw) {
 
 app.post("/download", (req, res) => {
     const rawUrl = req.body && req.body.url;
+    const rawTitle = req.body && typeof req.body.title === "string" ? req.body.title : "Kick-klibi";
+    const safeTitle = rawTitle.normalize("NFKC").replace(/[\\/:*?"<>|\x00-\x1F]/g, "-").replace(/\s+/g, " ").replace(/[. ]+$/g, "").trim().slice(0, 140) || "Kick-klibi";
     if (!rawUrl) return res.status(400).json({ error: "Kick bağlantısı gerekli." });
     if (!validKickUrl(rawUrl)) return res.status(403).json({ error: "Yalnızca SenuAhell kanalının Kick klip ve yayınları desteklenir." });
     if ([...jobs.values()].filter(job => job.status === "processing").length >= MAX_CONCURRENT_DOWNLOADS) return res.status(429).json({ error: `Şu anda en fazla ${MAX_CONCURRENT_DOWNLOADS} indirme aynı anda hazırlanabilir. Biraz sonra tekrar dene.` });
 
     const id = crypto.randomUUID();
     const output = path.join(os.tmpdir(), `${id}.mp4`);
-    const job = { status: "processing", progress: 0, output, createdAt: Date.now(), error: null, child: null, cancelled: false };
+    const job = { status: "processing", progress: 0, output, filename: `${safeTitle}.mp4`, createdAt: Date.now(), error: null, child: null, cancelled: false };
     jobs.set(id, job);
     const child = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "--progress", "--progress-template", "download:__PROGRESS__%(progress._percent)s", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, rawUrl], { detached: process.platform !== "win32" });
     job.child = child;
@@ -110,7 +112,7 @@ app.get("/download/:id/file", (req, res) => {
     const job = jobs.get(req.params.id);
     if (!job) return res.status(404).json({ error: "İndirme görevi bulunamadı." });
     if (job.status !== "ready" || !fs.existsSync(job.output)) return res.status(409).json({ error: "Video henüz hazır değil." });
-    res.download(job.output, "senuahell-video.mp4", error => { if (error) console.error(`[DOWNLOAD] ${req.params.id} dosya gönderimi:`, error); });
+    res.download(job.output, job.filename || "Kick-klibi.mp4", error => { if (error) console.error(`[DOWNLOAD] ${req.params.id} dosya gönderimi:`, error); });
 });
 
 setInterval(() => {
