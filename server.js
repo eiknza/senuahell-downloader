@@ -8,12 +8,13 @@ const crypto = require("crypto");
 
 const app = express();
 const jobs = new Map();
+const MAX_CONCURRENT_DOWNLOADS = Math.max(1, Math.min(20, Number.parseInt(process.env.MAX_CONCURRENT_DOWNLOADS || "5", 10) || 5));
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "20kb" }));
 app.use((req, res, next) => { console.log(`[REQUEST] ${req.method} ${req.originalUrl}`); next(); });
 
-app.get("/", (req, res) => res.json({ durum: "çevrimiçi", hizmet: "SenuAhell İndirici", sürüm: 2 }));
-app.get("/health", (req, res) => res.json({ status: "ok", version: 2 }));
+app.get("/", (req, res) => res.json({ durum: "çevrimiçi", hizmet: "SenuAhell İndirici", sürüm: 3, maxConcurrentDownloads: MAX_CONCURRENT_DOWNLOADS }));
+app.get("/health", (req, res) => res.json({ status: "ok", version: 3, maxConcurrentDownloads: MAX_CONCURRENT_DOWNLOADS }));
 
 function validKickUrl(raw) {
     try {
@@ -26,7 +27,7 @@ app.post("/download", (req, res) => {
     const rawUrl = req.body && req.body.url;
     if (!rawUrl) return res.status(400).json({ error: "Kick bağlantısı gerekli." });
     if (!validKickUrl(rawUrl)) return res.status(403).json({ error: "Yalnızca SenuAhell kanalının Kick klip ve yayınları desteklenir." });
-    if ([...jobs.values()].filter(job => job.status === "processing").length >= 2) return res.status(429).json({ error: "Şu anda başka indirmeler hazırlanıyor. Biraz sonra tekrar dene." });
+    if ([...jobs.values()].filter(job => job.status === "processing").length >= MAX_CONCURRENT_DOWNLOADS) return res.status(429).json({ error: `Şu anda en fazla ${MAX_CONCURRENT_DOWNLOADS} indirme aynı anda hazırlanabilir. Biraz sonra tekrar dene.` });
 
     const id = crypto.randomUUID();
     const output = path.join(os.tmpdir(), `${id}.mp4`);
