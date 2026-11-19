@@ -32,7 +32,8 @@ app.post("/download", (req, res) => {
     const output = path.join(os.tmpdir(), `${id}.mp4`);
     const job = { status: "processing", progress: 0, output, createdAt: Date.now(), error: null, child: null, cancelled: false };
     jobs.set(id, job);
-    const child = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "--progress", "--progress-template", "download:__PROGRESS__%(progress._percent)s", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, rawUrl]);
+    const child = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "--progress", "--progress-template", "download:__PROGRESS__%(progress._percent)s", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, rawUrl], { detached: process.platform !== "win32" });
+    job.child = child;
     let errorText = "";
     let buffer = "";
     const timeout = setTimeout(() => child.kill("SIGKILL"), 15 * 60 * 1000);
@@ -47,7 +48,7 @@ app.post("/download", (req, res) => {
 
     child.stdout.on("data", readProgress);
     child.stderr.on("data", data => { errorText = (errorText + data.toString()).slice(-5000); readProgress(data); });
-    child.on("error", error => { clearTimeout(timeout); job.status = "error"; job.error = "İndirme işlemi başlatılamadı: " + error.message; });
+    child.on("error", error => { clearTimeout(timeout); job.child = null; if (job.cancelled) { job.status = "cancelled"; return; } job.status = "error"; job.error = "İndirme işlemi başlatılamadı: " + error.message; });
     child.on("close", code => {
         clearTimeout(timeout);
         job.child = null;
@@ -73,14 +74,29 @@ app.post("/download", (req, res) => {
 app.delete("/download/:id", (req, res) => {
     const job = jobs.get(req.params.id);
     if (!job) return res.status(404).json({ error: "İndirme görevi bulunamadı." });
-    if (job.status === "processing" && job.child) {
+    if (job.status === "processing") {
         job.cancelled = true;
         job.status = "cancelled";
-        job.child.kill("SIGTERM");
-        setTimeout(() => { if (job.child && !job.child.killed) job.child.kill("SIGKILL"); }, 3000).unref();
-        if (fs.existsSync(job.output)) fs.unlinkSync(job.output);
+        const child = job.child;
+        if (child && child.exitCode === null && child.signalCode === null) {
+            try {
+                if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
+                else child.kill("SIGTERM");
+            } catch (error) { if (error.code !== "ESRCH") console.error(`[CANCEL] ${req.params.id}:`, error.message); }
+            const killTimer = setTimeout(() => {
+                if (child.exitCode === null && child.signalCode === null) {
+                    try {
+                        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+                        else child.kill("SIGKILL");
+                    } catch (error) { if (error.code !== "ESRCH") console.error(`[CANCEL-KILL] ${req.params.id}:`, error.message); }
+                }
+            }, 2500);
+            killTimer.unref();
+        }
+        try { if (fs.existsSync(job.output)) fs.unlinkSync(job.output); } catch (error) { console.error(`[CANCEL-FILE] ${req.params.id}:`, error.message); }
+        console.log(`[CANCEL] ${req.params.id} iptal edildi.`);
     }
-    return res.json({ status: job.status, cancelled: true });
+    return res.json({ status: job.status, cancelled: job.cancelled });
 });
 
 app.get("/download/:id", (req, res) => {
