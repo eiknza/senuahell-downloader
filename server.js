@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
@@ -8,86 +7,82 @@ const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
+const jobs = new Map();
 app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "20kb" }));
+app.use((req, res, next) => { console.log(`[REQUEST] ${req.method} ${req.originalUrl}`); next(); });
 
-app.use((req, res, next) => {
-    console.log(`[REQUEST] ${req.method} ${req.originalUrl}`);
-    next();
-});
+app.get("/", (req, res) => res.json({ durum: "çevrimiçi", hizmet: "SenuAhell İndirici", sürüm: 2 }));
+app.get("/health", (req, res) => res.json({ status: "ok", version: 2 }));
 
-app.get("/", (req, res) => res.json({ durum: "çevrimiçi", hizmet: "SenuAhell İndirici" }));
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-app.get("/debug", (req, res) => {
-    const check = spawn("yt-dlp", ["--version"]);
-    let output = "";
-    check.stdout.on("data", data => output += data.toString());
-    check.on("error", error => res.status(500).json({ yt_dlp: "çalışmıyor", error: error.message }));
-    check.on("close", code => {
-        if (!res.headersSent) res.json({ yt_dlp: code === 0 ? "hazır" : "hata", version: output.trim() });
-    });
-});
-
-app.get("/download", (req, res) => {
-    const rawUrl = req.query.url;
-    if (!rawUrl) return res.status(400).json({ error: "Kick bağlantısı gerekli." });
-
-    let videoUrl;
+function validKickUrl(raw) {
     try {
-        videoUrl = new URL(rawUrl);
-    } catch {
-        return res.status(400).json({ error: "Geçersiz bağlantı." });
-    }
+        const u = new URL(raw);
+        return u.protocol === "https:" && ["kick.com", "www.kick.com"].includes(u.hostname) && (/^\/senuahell\/(clips|videos)\//.test(u.pathname) || /^\/video\/[0-9a-f-]{36}$/i.test(u.pathname));
+    } catch { return false; }
+}
 
-    if (videoUrl.protocol !== "https:" || !["kick.com", "www.kick.com"].includes(videoUrl.hostname) || !/^\/senuahell\/(clips|videos)\//.test(videoUrl.pathname)) {
-        return res.status(403).json({ error: "Yalnızca SenuAhell kanalının Kick klip ve yayınları desteklenir." });
-    }
+app.post("/download", (req, res) => {
+    const rawUrl = req.body && req.body.url;
+    if (!rawUrl) return res.status(400).json({ error: "Kick bağlantısı gerekli." });
+    if (!validKickUrl(rawUrl)) return res.status(403).json({ error: "Yalnızca SenuAhell kanalının Kick klip ve yayınları desteklenir." });
+    if ([...jobs.values()].filter(job => job.status === "processing").length >= 2) return res.status(429).json({ error: "Şu anda başka indirmeler hazırlanıyor. Biraz sonra tekrar dene." });
 
     const id = crypto.randomUUID();
     const output = path.join(os.tmpdir(), `${id}.mp4`);
-    console.log(`[DOWNLOAD] Başladı: ${videoUrl.href}`);
-
-    const process = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, videoUrl.href]);
+    const job = { status: "processing", progress: 0, output, createdAt: Date.now(), error: null };
+    jobs.set(id, job);
+    const child = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "--progress", "--progress-template", "download:__PROGRESS__%(progress._percent)s", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, rawUrl]);
     let errorText = "";
-    let finished = false;
+    let buffer = "";
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 15 * 60 * 1000);
 
-    const timeout = setTimeout(() => {
-        if (!finished) {
-            console.error("[DOWNLOAD] 10 dakika zaman aşımı.");
-            process.kill("SIGKILL");
-        }
-    }, 10 * 60 * 1000);
+    function readProgress(data) {
+        const text = data.toString();
+        buffer = (buffer + text).slice(-10000);
+        const matches = [...buffer.matchAll(/(?:__PROGRESS__|\[download\])\s*(\d+(?:\.\d+)?)%/g)];
+        if (matches.length) job.progress = Math.max(job.progress, Math.min(99, Math.floor(Number(matches[matches.length - 1][1]))));
+        console.log(`[YT-DLP ${id}] ${text.trim()}`);
+    }
 
-    process.stdout.on("data", data => console.log(`[YT-DLP] ${data.toString().trim()}`));
-    process.stderr.on("data", data => {
-        errorText += data.toString();
-        console.error(`[YT-DLP ERROR] ${data.toString().trim()}`);
-    });
-
-    process.on("error", error => {
-        finished = true;
+    child.stdout.on("data", readProgress);
+    child.stderr.on("data", data => { errorText = (errorText + data.toString()).slice(-5000); readProgress(data); });
+    child.on("error", error => { clearTimeout(timeout); job.status = "error"; job.error = "İndirme işlemi başlatılamadı: " + error.message; });
+    child.on("close", code => {
         clearTimeout(timeout);
-        console.error("[DOWNLOAD] İşlem başlatılamadı:", error);
-        if (!res.headersSent) res.status(500).json({ error: "yt-dlp başlatılamadı." });
-    });
-
-    process.on("close", code => {
-        finished = true;
-        clearTimeout(timeout);
-        console.log(`[DOWNLOAD] İşlem bitti. Kod: ${code}`);
-
-        if (code !== 0 || !fs.existsSync(output)) {
+        if (code === 0 && fs.existsSync(output) && fs.statSync(output).size > 0) {
+            job.status = "ready";
+            job.progress = 100;
+            console.log(`[DOWNLOAD] ${id} hazır (${fs.statSync(output).size} byte).`);
+        } else {
+            job.status = "error";
+            job.error = errorText.slice(-1500) || "Video indirilemedi. Kick bağlantısını kontrol et.";
+            console.error(`[DOWNLOAD] ${id} başarısız: ${job.error}`);
             if (fs.existsSync(output)) fs.unlinkSync(output);
-            if (!res.headersSent) res.status(502).json({ error: "Video indirilemedi.", detail: errorText.slice(-2000) });
-            return;
         }
-
-        res.download(output, "senuahell-video.mp4", error => {
-            fs.unlink(output, () => {});
-            if (error) console.error("[DOWNLOAD] Dosya gönderilemedi:", error);
-        });
     });
+    res.status(202).json({ jobId: id, status: job.status, progress: job.progress });
 });
 
+app.get("/download/:id", (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: "İndirme görevi bulunamadı." });
+    res.json({ status: job.status, progress: job.progress, error: job.error });
+});
+
+app.get("/download/:id/file", (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: "İndirme görevi bulunamadı." });
+    if (job.status !== "ready" || !fs.existsSync(job.output)) return res.status(409).json({ error: "Video henüz hazır değil." });
+    res.download(job.output, "senuahell-video.mp4", error => { if (error) console.error(`[DOWNLOAD] ${req.params.id} dosya gönderimi:`, error); });
+});
+
+setInterval(() => {
+    for (const [id, job] of jobs) if (Date.now() - job.createdAt > 60 * 60 * 1000) {
+        if (fs.existsSync(job.output)) fs.unlinkSync(job.output);
+        jobs.delete(id);
+    }
+}, 10 * 60 * 1000).unref();
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`SenuAhell Downloader running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`SenuAhell Downloader v2 running on port ${PORT}`));
