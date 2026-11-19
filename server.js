@@ -30,7 +30,7 @@ app.post("/download", (req, res) => {
 
     const id = crypto.randomUUID();
     const output = path.join(os.tmpdir(), `${id}.mp4`);
-    const job = { status: "processing", progress: 0, output, createdAt: Date.now(), error: null };
+    const job = { status: "processing", progress: 0, output, createdAt: Date.now(), error: null, child: null, cancelled: false };
     jobs.set(id, job);
     const child = spawn("yt-dlp", ["--no-warnings", "--no-playlist", "--newline", "--progress", "--progress-template", "download:__PROGRESS__%(progress._percent)s", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", output, rawUrl]);
     let errorText = "";
@@ -50,6 +50,12 @@ app.post("/download", (req, res) => {
     child.on("error", error => { clearTimeout(timeout); job.status = "error"; job.error = "İndirme işlemi başlatılamadı: " + error.message; });
     child.on("close", code => {
         clearTimeout(timeout);
+        job.child = null;
+        if (job.cancelled) {
+            job.status = "cancelled";
+            if (fs.existsSync(output)) fs.unlinkSync(output);
+            return;
+        }
         if (code === 0 && fs.existsSync(output) && fs.statSync(output).size > 0) {
             job.status = "ready";
             job.progress = 100;
@@ -62,6 +68,19 @@ app.post("/download", (req, res) => {
         }
     });
     res.status(202).json({ jobId: id, status: job.status, progress: job.progress });
+});
+
+app.delete("/download/:id", (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: "İndirme görevi bulunamadı." });
+    if (job.status === "processing" && job.child) {
+        job.cancelled = true;
+        job.status = "cancelled";
+        job.child.kill("SIGTERM");
+        setTimeout(() => { if (job.child && !job.child.killed) job.child.kill("SIGKILL"); }, 3000).unref();
+        if (fs.existsSync(job.output)) fs.unlinkSync(job.output);
+    }
+    return res.json({ status: job.status, cancelled: true });
 });
 
 app.get("/download/:id", (req, res) => {
